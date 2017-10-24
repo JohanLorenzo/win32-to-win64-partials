@@ -14,8 +14,8 @@ import time
 BRANCH = "mozilla-release"
 REPO_PATH = "releases/{}".format(BRANCH)
 FROM = {
-    "version": "56.0.1",
-    "build_number": 2
+    "version": "56.0",
+    "build_number": 6
 }
 TO = {
     "version": "56.0.2",
