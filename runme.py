@@ -1,6 +1,6 @@
 import requests
+import taskcluster
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
-from taskcluster import Scheduler
 from taskcluster.utils import stableSlugId, encryptEnvVar, slugId
 from chunkify import chunkify
 import arrow
@@ -14,15 +14,14 @@ import time
 BRANCH = "mozilla-release"
 REPO_PATH = "releases/{}".format(BRANCH)
 FROM = {
-    "version": "56.0",
-    "build_number": 6
-}
-TO = {
     "version": "56.0.1",
     "build_number": 2
 }
+TO = {
+    "version": "56.0.2",
+    "build_number": 1
+}
 PLATFORMS = ("win32",)   # for bouncers
-
 
 bouncer_platform_map = {
     'win32': 'win',
@@ -32,26 +31,14 @@ bouncer_platform_map = {
     'macosx64': 'osx'
 }
 
-complete_to_mar_task_ids_per_chunk_map = {
-    1: 'eM2m3jIfSLuJyvJFZ186SQ',
-    10: 'GK7vdU3KS9eQ4ybKKfGctw',
-    2: 'fYOP2ttPQNWeE6ARKrr5hQ',
-    3: 'O6Upgz_ZQ_q4Uvniy8iNLQ',
-    4: 'NYDp2D-MTyCgFrooZ7q5gQ',
-    5: 'NDJ3rsH7TIqRmCqm4ZcJGw',
-    6: 'KcW6rfarTJi47hUVqsmdiQ',
-    7: 'MS4S0i_LTFqaxM2T8rx1hw',
-    8: 'd_VhAiurTOer70d_loPBGA',
-    9: 'Gub9Dj_CRd2RqDy0GCjlag',
-}
-en_us_mar_task_id = 'fRPlsYotQZCSMfICJJJ6wA'
+
+def find_task_id_from_route(route):
+    index = taskcluster.Index()
+    return index.findTask(route)["taskId"]
+
 
 def buildbot2bouncer(platform):
     return bouncer_platform_map.get(platform, platform)
-
-
-def complete_to_mar_task_ids_per_chunk(chunk):
-    return complete_to_mar_task_ids_per_chunk_map[chunk]
 
 
 def get_locales(repo_path, version, revision=None):
@@ -63,7 +50,7 @@ def get_locales(repo_path, version, revision=None):
     # FIXME: mac is different!
     locales = [
         line.split()[0] for line in req.text.splitlines()
-        if not (line.startswith("ja-JP-mac") or line.startswith("en-US"))
+        if not line.startswith("ja-JP-mac")
     ]
     return locales
 
@@ -138,8 +125,9 @@ template_vars = {
     "signing_class": "release-signing",
     "build_tools_repo_path": "build/tools",
     "buildbot2bouncer": buildbot2bouncer,
-    "complete_to_mar_task_ids_per_chunk": complete_to_mar_task_ids_per_chunk,
-    "complete_en_us_mar_task_id": en_us_mar_task_id,
+    "funsize_update_generator_image_task": find_task_id_from_route("releases.v1.mozilla-release.latest.firefox.latest.funsize_update_generator_image"),
+    "funsize_balrog_submitter_image_task": find_task_id_from_route("releases.v1.mozilla-release.latest.firefox.latest.funsize_balrog_image"),
+    "beetmover_image_task": find_task_id_from_route("releases.v1.mozilla-release.latest.firefox.latest.beetmove_image"),
     "for_sure": True,
 }
 
@@ -147,6 +135,7 @@ graph_repr = template.render(**template_vars)
 graph = yaml.safe_load(graph_repr)
 print(yaml.safe_dump(graph))
 
-scheduler = Scheduler(tc_config)
+scheduler = taskcluster.Scheduler(tc_config)
 graph_id = slugId()
 #print(scheduler.createTaskGraph(graph_id, graph))
+
