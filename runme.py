@@ -138,4 +138,3 @@ print(yaml.safe_dump(graph))
 scheduler = taskcluster.Scheduler(tc_config)
 graph_id = slugId()
 #print(scheduler.createTaskGraph(graph_id, graph))
-
