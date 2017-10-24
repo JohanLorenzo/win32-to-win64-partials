@@ -1,0 +1,7 @@
+---
+balrog_username: u
+balrog_password: p
+beetmover_aws_access_key_id: i
+beetmover_aws_secret_access_key: k
+taskcluster_client_id: c
+taskcluster_access_token: t

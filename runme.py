@@ -145,7 +145,8 @@ template_vars = {
 
 graph_repr = template.render(**template_vars)
 graph = yaml.safe_load(graph_repr)
-print(yaml.safe_dump(graph))
+# Print graph for external use, like in https://github.com/rail/graph2tasks
+#print(yaml.safe_dump(graph))
 
 scheduler = Scheduler(tc_config)
 graph_id = slugId()
