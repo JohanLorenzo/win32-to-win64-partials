@@ -1,0 +1,374 @@
+---
+metadata:
+    name: "Release Promotion"
+    description: "Release Promotion"
+    owner: "release@mozilla.com"
+    source: "https://github.com/rail/releasetasks"
+
+scopes:
+  - project:releng:signing:format:gpg
+  - queue:define-task:buildbot-bridge/buildbot-bridge
+  - queue:create-task:buildbot-bridge/buildbot-bridge
+  - queue:task-priority:high
+  - project:releng:buildbot-bridge:builder-name:release-*
+  - queue:define-task:aws-provisioner-v1/opt-linux64
+  - queue:create-task:aws-provisioner-v1/opt-linux64
+  - docker-worker:cache:tc-vcs
+  - docker-worker:image:taskcluster/builder:*
+  - queue:define-task:aws-provisioner-v1/build-c4-2xlarge
+  - queue:create-task:aws-provisioner-v1/build-c4-2xlarge
+  - docker-worker:cache:build-{{ branch }}-release-workspace
+  - docker-worker:cache:tooltool-cache
+  - project:releng:signing:cert:{{ signing_class }}
+  - docker-worker:relengapi-proxy:tooltool.download.public
+  - queue:*
+  - docker-worker:*
+  - scheduler:*
+  - project:releng:signing:format:mar_sha384
+  - project:releng:signing:cert:{{ signing_class }}
+  - docker-worker:feature:balrogVPNProxy
+
+tasks:
+{% set uv_deps = [] %}
+{% for platform in platforms %}
+{% for chunk in range(1, chunks + 1) %}
+{% set our_locales = chunkify(sorted(locales), chunk, chunks) %}
+{% if chunk == chunks %}
+{% set our_locales = our_locales + ["en-US"] %}
+{% endif %}
+  -
+    taskId: "{{ stableSlugId('generate_{}_{}'.format(platform, chunk)) }}"
+    reruns: 5
+    task:
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        workerType: "funsize-mar-generator"
+        provisionerId: "aws-provisioner-v1"
+        metadata:
+            owner: release+funsize@mozilla.com
+            source: https://github.com/mozilla/funsize
+            name: "[win32 to win64][funsize] Update generating task chunk {{ chunk }}"
+            description: This task generates MAR files and publishes unsigned bits for the locales {{ our_locales|join(', ') }}
+        extra:
+          funsize:
+            partials:
+{% for locale in our_locales %}
+                -
+                    locale: {{ locale }}
+                    from_mar: "http://download.mozilla.org/?product={{ product }}-{{ from_version }}-complete&os={{ buildbot2bouncer(platform) }}&lang={{ locale }}"
+{% if locale == "en-US" %}
+                    to_mar: "https://queue.taskcluster.net/v1/task/{{ complete_en_us_mar_task_id }}/artifacts/public/build/target.complete.mar"
+{% else %}
+                    to_mar: "https://queue.taskcluster.net/v1/task/{{ complete_to_mar_task_ids_per_chunk(chunk) }}/artifacts/public/build/firefox-56.0.1.{{ locale }}.win64.complete.mar"
+{% endif %}
+                    platform: {{ platform }}
+                    branch: {{ branch }}
+                    previousVersion: "{{ from_version }}"
+                    previousBuildNumber: {{ from_build_number }}
+                    toVersion: "{{ to_version }}"
+                    toBuildNumber: {{ to_build_number }}
+{% endfor %}
+        created: "{{ now }}"
+        payload:
+          image:
+            path: "public/image.tar.zst"
+            type: "task-image"
+            taskId: "O2mykWRCTb2X-cr5qi2Beg"
+          maxRunTime: 7200
+          command:
+              - /runme.sh
+          env:
+              # {locale} is interpreted by funsize, don't use double brackets
+              FILENAME_TEMPLATE: "{{ product }}-{{ from_version }}-{{ to_version }}.{locale}.win32-to-win64.partial.mar"
+              EXTRA_PARAMS: "--no-freshclam"
+              SHA384_SIGNING_CERT: "release_sha384"
+              SHA1_SIGNING_CERT: "release_sha1"
+          artifacts:
+              "public/env":
+                  path: /home/worker/artifacts/
+                  type: directory
+                  expires: "{{ never }}"
+
+  -
+    taskId: "{{ stableSlugId('sign_{}_{}'.format(platform, chunk)) }}"
+    reruns: 5
+    requires:
+        - "{{ stableSlugId('generate_{}_{}'.format(platform, chunk)) }}"
+    task:
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        metadata:
+            owner: release+funsize@mozilla.com
+            source: https://github.com/mozilla/funsize
+            name: "[win32 to win64][funsize] MAR signing task {{ platform }} chunk {{ chunk }}"
+            description: This task signs MAR files and publishes signed bits for the locales {{ our_locales|join(', ') }}
+        workerType: "signing-worker-v1"
+        provisionerId: "signing-provisioner-v1"
+        scopes:
+            - project:releng:signing:cert:{{ signing_class }}
+            - project:releng:signing:format:gpg
+            - project:releng:signing:format:mar_sha384
+        extra:
+            signing:
+              signature: {{ sign_task(stableSlugId('sign_{}_{}'.format(platform, chunk)), valid_for=8 * 3600) }}
+        payload:
+            signingManifest: "https://queue.taskcluster.net/v1/task/{{ stableSlugId('generate_{}_{}'.format(platform, chunk)) }}/artifacts/public/env/manifest.json"
+
+{% if for_sure %}
+{% do uv_deps.append('balrog_{}_{}'.format(platform, chunk)) %}
+  -
+    taskId: "{{ stableSlugId('balrog_{}_{}'.format(platform, chunk)) }}"
+    reruns: 5
+    requires:
+        - "{{ stableSlugId('sign_{}_{}'.format(platform, chunk)) }}"
+    task:
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        metadata:
+            owner: release+funsize@mozilla.com
+            source: https://github.com/mozilla/funsize
+            name: "[win32 to win64][funsize] Publish to Balrog {{ platform }} chunk {{ chunk }}"
+            description: |
+                This task publishes signed updates to Balrog for the locales {{ our_locales|join(", ")}}.
+
+        workerType: "funsize-balrog"
+        provisionerId: "aws-provisioner-v1"
+        scopes:
+            - docker-worker:feature:balrogVPNProxy
+        payload:
+            image: 
+                path: "public/image.tar.zst"
+                type: "task-image"
+                taskId: "JD0HwmhnR8WA_6tVdrLb4w"
+            maxRunTime: 1800
+            command:
+                - /runme.sh
+
+            artifacts:
+               "public/env":
+                   path: /home/worker/artifacts/
+                   type: directory
+                   expires: "{{ never }}"
+
+            env:
+                SIGNING_CERT: "release"
+                SHA384_SIGNING_CERT: "release_sha384"
+                SHA1_SIGNING_CERT: "release_sha1"
+                PARENT_TASK_ARTIFACTS_URL_PREFIX: "https://queue.taskcluster.net/v1/task/{{ stableSlugId('sign_{}_{}'.format(platform, chunk)) }}/artifacts/public/env"
+                BALROG_API_ROOT: "http://balrog/api"
+            encryptedEnv:
+                - {{ encrypt_env_var(stableSlugId('balrog_{}_{}'.format(platform, chunk)), now_ms, now_ms + 24 * 4 * 3600 * 1000, "BALROG_USERNAME", balrog_username) }}
+                - {{ encrypt_env_var(stableSlugId('balrog_{}_{}'.format(platform, chunk)), now_ms, now_ms + 24 * 4 * 3600 * 1000, "BALROG_PASSWORD", balrog_password) }}
+            features:
+                balrogVPNProxy: true
+
+{% do uv_deps.append('beetmove_{}_{}'.format(platform, chunk)) %}
+  -
+      taskId: {{ stableSlugId('beetmove_{}_{}'.format(platform, chunk)) }}
+      requires:
+          - "{{ stableSlugId('sign_{}_{}'.format(platform, chunk)) }}"
+      reruns: 5
+      task:
+          provisionerId: aws-provisioner-v1
+          workerType: opt-linux64
+          created: "{{ now }}"
+          deadline: "{{ now.replace(days=4) }}"
+          expires: "{{ never }}"
+          priority: "high"
+          retries: 5
+          payload:
+              maxRunTime: 7200
+              image:
+                  type: task-image
+                  path: public/image.tar.zst
+                  taskId: "LImyHeTMQgekJ98oIj_tsA"
+              command:
+                  - /bin/bash
+                  - -c
+                  - >
+                    wget -O mozharness.tar.bz2 https://hg.mozilla.org/{{ repo_path }}/archive/{{ mozharness_changeset }}.tar.bz2/testing/mozharness &&
+                    mkdir mozharness && tar xvfj mozharness.tar.bz2 -C mozharness --strip-components 3 && cd mozharness &&
+                    python scripts/release/beet_mover.py --template configs/beetmover/win32_to_win64_partials.yml.tmpl --platform {{ platform }} --product {{ product }} --version {{ to_version }} --partial-version {{ from_version }} --artifact-subdir env {% for l in our_locales %}{{ "--locale {} ".format(l) }}{% endfor %} --taskid {{ stableSlugId('sign_{}_{}'.format(platform, chunk)) }} --build-num build{{ to_build_number }} --bucket {{ beetmover_candidates_bucket }} --no-refresh-antivirus
+              env:
+                  DUMMY_ENV_FOR_ENCRYPT: "fake"
+              encryptedEnv:
+                  - {{ encrypt_env_var(stableSlugId('beetmove_{}_{}'.format(platform, chunk)), now_ms, now_ms + 24 * 4 * 3600 * 1000, 'AWS_ACCESS_KEY_ID', beetmover_aws_access_key_id) }}
+                  - {{ encrypt_env_var(stableSlugId('beetmove_{}_{}'.format(platform, chunk)), now_ms, now_ms + 24 * 4 * 3600 * 1000, 'AWS_SECRET_ACCESS_KEY', beetmover_aws_secret_access_key) }}
+          metadata:
+              name: "[win32 to win64][beetmover] {{ platform }} locales partials candidates {{ chunk }}"
+              description: "moves partial artifacts for locale based builds to candidates dir"
+              owner: "release@mozilla.com"
+              source: https://github.com/mozilla/releasetasks
+{# endif for_sure #}
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+
+{% if for_sure %}
+
+{% for platform in platforms %}
+{% for channel in ["release"] %}
+{% set uv_totalchunks = 4 %}
+{% for chunk in range(1, uv_totalchunks + 1) %}
+{% set uv_buildername = "release-{}_{}_{}_update_verify".format(branch, product, platform) %}
+{% set task_name = "{}_{}_{}".format(uv_buildername, channel, chunk) %}
+
+{% if platform in ["win32", "win64", "macosx64"] %}
+  -
+    taskId: "{{ stableSlugId(task_name) }}"
+    requires:
+        {% for upstream_builder in uv_deps %}
+        - {{ stableSlugId(upstream_builder) }}
+        {% endfor %}
+    reruns: 3
+    task:
+        provisionerId: buildbot-bridge
+        workerType: buildbot-bridge
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        retries: 5
+        scopes:
+            - project:releng:buildbot-bridge:builder-name:{{ uv_buildername }}
+        payload:
+            buildername: "{{ uv_buildername }}"
+            sourcestamp:
+                branch: "{{ repo_path }}"
+                revision: "default"
+            properties:
+                product: "{{ product }}"
+                version: "{{ to_version }}"
+                build_number: {{ to_build_number }}
+                revision: "default"
+                release_promotion: true
+                script_repo_revision: "{{ "{product}_{version}_BUILD{buildNumber}_RUNTIME".format(
+                    product=product.upper(),
+                    version=to_version.replace('.', '_'),
+                    buildNumber=to_build_number) }}"
+                NO_BBCONFIG: "1"
+                VERIFY_CONFIG: "{{ channel }}-{{ product }}-{{ platform }}.cfg"
+                TOTAL_CHUNKS: "{{ uv_totalchunks }}"
+                THIS_CHUNK: "{{ chunk }}"
+
+        metadata:
+            owner: release@mozilla.com
+            source: https://github.com/mozilla/releasetasks
+            name: "[win32 to win64]{{ platform }} {{ channel }} update verification {{ chunk }}/{{ uv_totalchunks }}"
+            description: |
+                Verifies updates for {{ platform }}
+{% else %}
+  -
+    taskId: "{{ stableSlugId(task_name) }}"
+    requires:
+        {% for upstream_builder in uv_deps %}
+        - {{ stableSlugId(upstream_builder) }}
+        {% endfor %}
+    reruns: 3
+    task:
+        provisionerId: aws-provisioner-v1
+        workerType: opt-linux64
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        retries: 5
+        payload:
+            maxRunTime: 7200
+            image: callek/update-test-runner2
+            command:
+                - /bin/bash
+                - -c
+                - hg clone https://hg.mozilla.org/{{ build_tools_repo_path }} tools && cd tools && hg up -r $TAG && cd .. && /tools/scripts/release/updates/chunked-verify.sh UNUSED UNUSED $TOTAL_CHUNKS $THIS_CHUNK
+            env:
+                TAG: "{{ "{product}_{version}_BUILD{buildNumber}_RUNTIME".format(
+                    product=product.upper(),
+                    version=to_version.replace('.', '_'),
+                    buildNumber=to_build_number) }}"
+                TOTAL_CHUNKS: "{{ uv_totalchunks }}"
+                THIS_CHUNK: "{{ chunk }}"
+                NO_BBCONFIG: "1"
+                VERIFY_CONFIG: "{{ "{channel}-{product}-{platform}.cfg".format(
+                                   platform=platform,
+                                   channel=channel,
+                                   product=product) }}"
+        metadata:
+            owner: release@mozilla.com
+            source: https://github.com/mozilla/releasetasks
+            name: "[win32 to win64]{{ platform }} {{ channel }} update verification {{ chunk }}/{{ uv_totalchunks }}"
+            description: |
+                Verifies updates for {{ platform }}
+{% endif %}
+
+{% endfor %}
+{% endfor %}
+{% endfor %}
+
+  -
+    taskId: "{{ stableSlugId('human_decision') }}"
+    reruns: 1
+    task:
+        provisionerId: "null-provisioner"
+        workerType: "human-decision"
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        retries: 5
+
+        payload:
+            description: "required"
+        metadata:
+            name: "[win32 to win64]{{ product }} {{ branch }} push to releases human decision task"
+            description: "Release Promotion push to releases human decision task"
+            owner: "release@mozilla.com"
+            source: https://github.com/mozilla/releasetasks
+
+  -
+    taskId: "{{ stableSlugId('push_to_releases') }}"
+    requires:
+        - {{ stableSlugId('human_decision') }}
+    reruns: 5
+    task:
+        provisionerId: aws-provisioner-v1
+        workerType: opt-linux64
+        created: "{{ now }}"
+        deadline: "{{ now.replace(days=4) }}"
+        expires: "{{ never }}"
+        priority: "high"
+        retries: 5
+        payload:
+            maxRunTime: 7200
+            image: "kmoir/python-beet-runner@sha256:4f6dc84c4386406090a9c72b976be03dea647f01fe45a023d63ce0e479eb3497"
+            command:
+                - /bin/bash
+                - -c
+                - >
+                  wget -O mozharness.tar.bz2 https://hg.mozilla.org/{{ repo_path }}/archive/{{ mozharness_changeset }}.tar.bz2/testing/mozharness &&
+                  mkdir mozharness && tar xvfj mozharness.tar.bz2 -C mozharness --strip-components 3 && cd mozharness &&
+                  python scripts/release/push-candidate-to-releases.py --product {{ product }} --version {{ to_version }} --build-number {{ to_build_number }} --bucket {{ beetmover_candidates_bucket }} --exclude '.*-EME-free/.*' --exclude '.*/win32-sha1/.*' --exclude '.*/snap/.*'
+            env:
+                DUMMY_ENV_FOR_ENCRYPT: "fake"
+            encryptedEnv:
+                - {{ encrypt_env_var(stableSlugId('push_to_releases'), now_ms,
+                                   now_ms + 24 * 4 * 3600 * 1000, 'AWS_ACCESS_KEY_ID',
+                                   beetmover_aws_access_key_id) }}
+                - {{ encrypt_env_var(stableSlugId('push_to_releases'), now_ms,
+                                   now_ms + 24 * 4 * 3600 * 1000, 'AWS_SECRET_ACCESS_KEY',
+                                   beetmover_aws_secret_access_key) }}
+        metadata:
+            name: "[win32 to win64][beetmover] {{ product }} {{ branch }} push to releases"
+            description: "moves candidates artifacts to releases dir. also known as push to mirrors"
+            owner: "release@mozilla.com"
+            source: https://github.com/mozilla/releasetasks
+
+{# endif for_sure #}
+{% endif %}
+
